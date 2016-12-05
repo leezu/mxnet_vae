@@ -8,6 +8,6 @@ def get_mnist():
     data_path = os.path.join(data_path, '../../data')
     mnist = fetch_mldata('MNIST original', data_home=data_path)
     p = np.random.permutation(mnist.data.shape[0])
-    X = mnist.data[p].astype(np.float32)*0.02
+    X = mnist.data[p].astype(np.float32)/255
     Y = mnist.target[p]
     return X, Y
