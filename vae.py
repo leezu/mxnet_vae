@@ -14,7 +14,7 @@ class VAE():
     """
 
     DEFAULTS = {
-        "nonlinearity": "relu",
+        "nonlinearity": "elu",
         "squashing": "sigmoid",
         "dropout": 0.0,  # Fraction of the input that gets dropped out at training time
     }
@@ -38,7 +38,7 @@ class VAE():
         z = mx.sym.Variable('data')
         decoder = self._build_decoder(z)
 
-        return z
+        return decoder
 
     def training_model(self):
         data = mx.sym.Variable('data')
@@ -65,7 +65,7 @@ class VAE():
                 name='encoder_{0}'.format(i),
                 data=x,
                 num_hidden=self.architecture[i])
-            x = mx.sym.Activation(data=x, act_type=self.nonlinearity)
+            x = mx.sym.LeakyReLU(data=x, act_type=self.nonlinearity)
             x = mx.sym.Dropout(data=x, p=self.dropout)
 
         z_mean = mx.sym.FullyConnected(
@@ -86,7 +86,7 @@ class VAE():
     def _build_z(self, z_mean, z_log_sigma):
         # broadcast_mul automatically broadcasts the normal symbol to the right shape
         return z_mean + mx.sym.broadcast_mul(
-            mx.sym.normal(shape=(1, self.architecture[-1])), mx.sym.exp(2 * z_log_sigma))
+            mx.sym.normal(shape=(1, self.architecture[-1])), mx.sym.exp(z_log_sigma))
 
     def _build_decoder(self, z):
         N = len(self.architecture)
@@ -96,7 +96,7 @@ class VAE():
                 name='decoder_{0}'.format(i),
                 data=x,
                 num_hidden=self.architecture[i])
-            x = mx.sym.Activation(data=x, act_type=self.nonlinearity)
+            x = mx.sym.LeakyReLU(data=x, act_type=self.nonlinearity)
             x = mx.sym.Dropout(data=x, p=self.dropout)
 
         x = mx.sym.FullyConnected(

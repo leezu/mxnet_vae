@@ -1,22 +1,51 @@
+"""MNIST VAE.
+
+Usage:
+  main.py train [options]
+  main.py continue [options]
+  main.py test [options]
+  main.py (-h | --help)
+
+Options:
+  -h --help                   Show this screen.
+  -b --batch_size=<b>         Batch size [default: 128].
+  -l --learning_rate=<lr>     Batch size [default: 5E-4].
+  -L --lambda_l2_reg=<lr>     Lambda L2 regularization [default: 1E-5].
+  -e --max_epochs=<e>         Number of epochs [default: 10].
+  -g --gpu=<e>                Number of GPU [default: 0].
+  -v --visualize              Show generated digits during training process
+  --log=<log>                 Directory for logging [default: ./log/]
+
+"""
+
 import mxnet as mx
 import vae
 import data
 import logging
-from opterator import opterate
+import os.path
+import time
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from docopt import docopt
 
-@opterate
-def main(action,
-         parameters="./parameters",
-         gpu=0,
-         batch_size=128,
-         learning_rate=0.000001,
-         num_epochs=1000):
-    gpu = int(gpu)
-    batch_size = int(batch_size)
-    learning_rate = float(learning_rate)
-    num_epochs = int(num_epochs)
+IMG_DIM = 28
+ARCHITECTURE = [IMG_DIM**2, 500, 500, 2]
 
-    network_structure = [784, 500, 250, 10]
+HYPERPARAMS = {
+    #"dropout": 0.9,
+    "nonlinearity": "elu",
+    "squashing": "squashing"
+}
+
+LOG_DIR = "./log"
+
+def main(docopts):
+    docopts["--batch_size"] = int(docopts["--batch_size"])
+    docopts["--gpu"] = int(docopts["--gpu"])
+    docopts["--lambda_l2_reg"] = float(docopts["--lambda_l2_reg"])
+    docopts["--learning_rate"] = float(docopts["--learning_rate"])
+    docopts["--max_epochs"] = int(docopts["--max_epochs"])
 
     # Logging
     logging.basicConfig(level=logging.INFO)
@@ -26,23 +55,25 @@ def main(action,
     #
 
     X, Y = data.get_mnist()
-    iter = mx.io.NDArrayIter(data=X, label=Y, batch_size=batch_size, shuffle=True)
+    iter = mx.io.NDArrayIter(data=X, label=Y, batch_size=docopts["--batch_size"], shuffle=True)
 
 
-    if action == "train" or action == "continue":
-        m = vae.VAE(network_structure)
+    if docopts["train"] or docopts["continue"]:
+        m = vae.VAE(ARCHITECTURE)
         sym = m.training_model()
 
-
-        if action == "train":
-            dbatch = iter.next()
-            exe = sym.simple_bind(ctx=mx.gpu(gpu), data = dbatch.data[0].shape)
-        elif action == "continue":
-            exe = sym.bind(ctx=mx.gpu(gpu), args = mx.nd.load(parameters))
+        dbatch = iter.next()
+        exe = sym.simple_bind(ctx=mx.gpu(docopts["--gpu"]), data = dbatch.data[0].shape)
 
         args = exe.arg_dict
         grads = exe.grad_dict
         outputs = dict(zip(sym.list_outputs(), exe.outputs))
+
+        if docopts["continue"]:
+            loaded_args = mx.nd.load(os.path.join(docopts["--log"], "parameters"))
+            for name in args:
+                if name != "data":
+                    args[name][:] = loaded_args[name]
 
         # Initialize parameters
         xavier = mx.init.Xavier()
@@ -50,28 +81,25 @@ def main(action,
             if name != "data":
                 xavier(name, nd_array)
 
-        # Optimizer
-        def SGD(key, weight, grad, lr=0.1, grad_norm=batch_size):
-            # key is key for weight, we can customize update rule
-            # weight is weight array
-            # grad is grad array
-            # lr is learning rate
-            # grad_norm is scalar to norm gradient, usually it is batch_size
-            norm = 1.0 / grad_norm
-            # here we can bias' learning rate 2 times larger than weight
-            if "weight" in key or "gamma" in key:
-                weight[:] -= lr * (grad * norm)
-            elif "bias" in key or "beta" in key:
-                weight[:] -= 2.0 * lr * (grad * norm)
-            else:
-                pass
+        optimizer = mx.optimizer.create(name="adam",
+                                        learning_rate=docopts["--learning_rate"],
+                                        wd=docopts["--lambda_l2_reg"])
+        updater = mx.optimizer.get_updater(optimizer)
 
         # Train
         keys = sym.list_arguments()
         optimizer = mx.optimizer.Adam()
 
-        for epoch in range(num_epochs):
+        if docopts["--visualize"]:
+            # Random image
+            last_image_time = time.time()
+            plt.ion()
+            figure = plt.figure()
+            imshow = plt.imshow(np.random.uniform(size=(28,28)), cmap="gray")
+
+        for epoch in range(docopts["--max_epochs"]):
             iter.reset()
+            epoch_start_time = time.time()
             batch = 0
             for dbatch in iter:
                 args["data"][:] = dbatch.data[0]
@@ -79,8 +107,18 @@ def main(action,
                 exe.forward(is_train=True)
                 exe.backward()
 
-                for key in keys:
-                    SGD(key, args[key], grads[key], lr=learning_rate)
+                if docopts["--visualize"]:
+                    # Throttle refresh ratio
+                    if time.time() - last_image_time > 0.1:
+                        last_image_time = time.time()
+                        imshow.set_data(exe.outputs[2][
+                            random.randint(0, docopts["--batch_size"])].reshape(
+                                (28,28)).asnumpy())
+                        figure.canvas.draw()
+                        figure.canvas.flush_events()
+
+                for index, key in enumerate(keys):
+                    updater(index=index, grad=grads[key], weight=args[key])
 
                 kl_divergence = exe.outputs[3].asnumpy()
                 cross_entropy = exe.outputs[4].asnumpy()
@@ -90,25 +128,71 @@ def main(action,
 
                 batch += 1
 
-            logging.info("Finish training epoch %d", epoch)
+            logging.info("Finish training epoch %d in %f seconds",
+                         epoch,
+                         time.time() - epoch_start_time)
 
-        # Save model parameters
-        mx.nd.save(parameters, args)
+        # Save model parameters (including data, to simplify loading / binding)
+        mx.nd.save(os.path.join(docopts["--log"], "parameters"),
+                   {x[0]: x[1] for x in args.items() if x[0] != "data"})
 
-    elif action == "test":
-        m = vae.VAE(network_structure)
+    elif docopts["test"]:
+        from matplotlib.widgets import Button
+
+        m = vae.VAE(ARCHITECTURE)
         sym = m.testing_model()
-        exe = sym.bind(ctx=mx.gpu(gpu), args = mx.nd.load(parameters))
+
+        exe = sym.simple_bind(ctx=mx.gpu(docopts["--gpu"]),
+                              data=(docopts["--batch_size"], ARCHITECTURE[-1]))
 
         args = exe.arg_dict
+        grads = exe.grad_dict
         outputs = dict(zip(sym.list_outputs(), exe.outputs))
 
-        args["data"][:] = np.random.randn(batch_size, network_structure[-1])
+        loaded_args = mx.nd.load(os.path.join(docopts["--log"], "parameters"))
+        for name in args:
+            if name != "data":
+                args[name][:] = loaded_args[name]
 
+        args["data"][:] = np.random.randn(docopts["--batch_size"], ARCHITECTURE[-1])
         exe.forward(is_train=True)
+        # testing_model has only 1 output
+        batch = exe.outputs[0].asnumpy().reshape(-1, 28, 28)
+        np.save(os.path.join(docopts["--log"], "output"), batch)
 
-        np.save("./output", exe.outputs[0].asnumpy())
+        imshow = plt.imshow(batch[0], cmap="gray")
+        callback = Index(imshow, batch)
+        axnext = plt.axes([0.8, 0.7, 0.1, 0.075])
+        axprev = plt.axes([0.8, 0.6, 0.1, 0.075])
+        next_button = Button(axnext, 'Next')
+        next_button.on_clicked(callback.next)
+        prev_button = Button(axprev, 'Previous')
+        prev_button.on_clicked(callback.prev)
 
+        plt.show()
+        plt.waitforbuttonpress()
+
+class Index(object):
+    def __init__(self, imshow, batch):
+        self.imshow = imshow
+        self.ind = 0
+        self.batch = batch
+        self.batch_size = len(batch)
+
+    def next(self, event):
+        self.ind = (self.ind + 1) % self.batch_size
+        self.imshow.set_data(self.batch[self.ind])
+        plt.draw()
+
+    def prev(self, event):
+        self.ind = (self.ind - 1) % self.batch_size
+        self.imshow.set_data(self.batch[self.ind])
+        plt.draw()
 
 if __name__ == "__main__":
-    main()
+    docopts = docopt(__doc__)
+
+    if not os.path.exists(docopts["--log"]):
+        os.makedirs(docopts["--log"])
+
+    main(docopts)
